@@ -1,0 +1,112 @@
+--- a/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
++++ b/io/papermc/paper/threadedregions/RegionizedTaskQueue.java
+@@ -24,6 +_,61 @@
+ 
+     private static final TicketType<Long> TASK_QUEUE_TICKET = ChunkSystemTicketType.create("task_queue_ticket", Long::compareTo);
+ 
++    // Canvas start - race-free task ownership routing
++    // Folia executes a queued chunk task trusting the invariant "a region's queue only holds tasks for
++    // chunks it owns", and the moonrise thread check guards the entity add with a LOCK-FREE read of the
++    // section->region map (getRegionAtUnsynchronised). That is safe under stock Folia's single-owner EDF
++    // scheduler, where no other thread mutates the map for chunks the draining region touches. Under
++    // Canvas's AFFINITY scheduler (work-stealing + mid-tick, 48 threads) a second worker can be applying a
++    // write-locked merge/split for a freshly streamed chunk (e.g. an RTP destination) concurrently with
++    // this drain, so the lock-free read tears and either crashes the ENTIRE server via regionFailed or
++    // mis-classifies the task. We therefore re-validate ownership with a *synchronised* read before
++    // executing, and route the task to its true owner when it is foreign. Counter is for observability of
++    // how often the underlying race actually fires.
++    private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger("RegionTaskOwnership");
++    private static final AtomicLong FOREIGN_REDISPATCH_COUNT = new AtomicLong();
++
++    // When the drain finds a task whose chunk the draining region does not own (per a synchronised read),
++    // emit one forensic record. It classifies the case as a torn lock-free read (the lock-free owner
++    // disagrees with the synchronised owner — the ownership read tore mid-merge/split) vs a genuine
++    // mis-route (both reads agree the chunk belongs to another region — the task is really in the wrong
++    // queue), names all three regions and the thread holding the regioniser write lock, and dumps the
++    // recent merge/split history so a single occurrence reveals the interleaving. Throttled so a burst
++    // cannot flood the log. The task itself is rerouted (never run off-region), so this never crashes.
++    static void onForeignTaskDiagnostic(
++        final ServerLevel world, final int chunkX, final int chunkZ, final boolean isChunkTask,
++        final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> draining,
++        final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> syncOwner,
++        final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> unsyncOwner
++    ) {
++        final long n = FOREIGN_REDISPATCH_COUNT.incrementAndGet();
++        // log the first 200 occurrences in full, then only powers of two, to bound log volume
++        if (n > 200 && (n & (n - 1L)) != 0L) {
++            return;
++        }
++        final boolean torn = syncOwner != unsyncOwner;
++        final Thread writeLockOwner = world.regioniser.debugWriteLockOwner();
++        LOGGER.warn(
++            "[region-task-ownership #{}] {} | world={} chunk=[{}, {}] taskType={} | drainingRegion={} syncOwner={} unsyncOwner={} | writeLockHeldBy={} drainThread={}\n  recent structural ops (most recent last):\n{}",
++            n,
++            torn ? "TORN_READ (lock-free owner != synchronised owner; ownership read tore mid merge/split)"
++                 : "GENUINE_MISROUTE (task is in a region that does not own its chunk)",
++            ca.spottedleaf.moonrise.common.util.WorldUtil.getWorldName(world),
++            chunkX, chunkZ, isChunkTask ? "chunk" : "tick",
++            describeRegion(draining), describeRegion(syncOwner), describeRegion(unsyncOwner),
++            writeLockOwner == null ? "none" : writeLockOwner.getName(),
++            Thread.currentThread().getName(),
++            world.regioniser.debugRecentStructuralOps()
++        );
++    }
++
++    private static String describeRegion(
++        final ThreadedRegionizer.ThreadedRegion<TickRegions.TickRegionData, TickRegions.TickRegionSectionData> region
++    ) {
++        return region == null ? "null" : ("#" + region.id + "@" + region.getCenterChunk());
++    }
++    // Canvas end - race-free task ownership routing
++
+     public PrioritisedExecutor.PrioritisedTask createChunkTask(final ServerLevel world, final int chunkX, final int chunkZ,
+                                                                final Runnable run) {
+         return this.createChunkTask(world, chunkX, chunkZ, run, Priority.NORMAL);
+@@ -469,7 +_,9 @@
+             }
+ 
+             try {
+-                task.executeInternal();
++                if (!task.redispatchIfForeign()) { // Canvas - race-free task ownership routing
++                    task.executeInternal();
++                }
+             } finally {
+                 task.world.decrementReference(referenceCounter, task.sectionLowerLeftCoord);
+             }
+@@ -547,6 +_,36 @@
+                     this.run = null;
+                 }
+             }
++
++            // Canvas start - race-free task ownership routing + forensic logging
++            // Returns true if the task was re-routed to its owning region (caller must NOT executeInternal).
++            // Decide ownership with a *synchronised* read (getRegionAtSynchronised: optimistic stamped read
++            // with read-lock fallback) so the decision is never made on a torn section->region map. If the
++            // draining region owns the chunk, run inline (ownership is stable while it is STATE_TICKING).
++            // Otherwise log one forensic record and reroute to the true owner — never crash the server.
++            private boolean redispatchIfForeign() {
++                final Runnable run = this.run;
++                if (run == null) {
++                    return false;
++                }
++                final ServerLevel level = this.world.world;
++                final var owner = level.regioniser.getRegionAtSynchronised(this.chunkX, this.chunkZ);
++                final var current = TickRegionScheduler.getCurrentRegion();
++                if (owner == current) {
++                    return false;
++                }
++                this.run = null;
++                final var unsyncOwner = level.regioniser.getRegionAtUnsynchronised(this.chunkX, this.chunkZ);
++                RegionizedTaskQueue.onForeignTaskDiagnostic(level, this.chunkX, this.chunkZ, this.isChunkTask, current, owner, unsyncOwner);
++                final RegionizedTaskQueue taskQueue = RegionizedServer.getInstance().taskQueue;
++                if (this.isChunkTask) {
++                    taskQueue.queueChunkTask(level, this.chunkX, this.chunkZ, run);
++                } else {
++                    taskQueue.queueTickTaskQueue(level, this.chunkX, this.chunkZ, run);
++                }
++                return true;
++            }
++            // Canvas end - race-free task ownership routing + forensic logging
+ 
+             private void cancelInternal() {
+                 this.run = null;

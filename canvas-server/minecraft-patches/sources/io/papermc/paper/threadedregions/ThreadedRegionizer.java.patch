@@ -1,0 +1,66 @@
+--- a/io/papermc/paper/threadedregions/ThreadedRegionizer.java
++++ b/io/papermc/paper/threadedregions/ThreadedRegionizer.java
+@@ -155,6 +_,34 @@
+         this.regionLock.tryUnlockWrite();
+     }
+ 
++    // Canvas - region crash diagnostics: best-effort read of the current write-lock owner (may be stale)
++    public Thread debugWriteLockOwner() {
++        return this.writeLockOwner;
++    }
++
++    // Canvas - region crash diagnostics: bounded ring buffer of recent merge/split operations, so a
++    // single foreign-task occurrence can be correlated with the structural change that caused it.
++    // Writes happen under the regioniser write lock (single writer); reads are diagnostic-only.
++    private static final int RECENT_OPS_CAP = 48;
++    private final java.util.concurrent.ConcurrentLinkedDeque<String> recentStructuralOps = new java.util.concurrent.ConcurrentLinkedDeque<>();
++    private final AtomicLong structuralOpSeq = new AtomicLong();
++
++    public void recordStructuralOp(final String op) {
++        final long seq = this.structuralOpSeq.incrementAndGet();
++        this.recentStructuralOps.addLast(seq + " t=" + System.nanoTime() + " [" + Thread.currentThread().getName() + "] " + op);
++        while (this.recentStructuralOps.size() > RECENT_OPS_CAP) {
++            this.recentStructuralOps.pollFirst();
++        }
++    }
++
++    public String debugRecentStructuralOps() {
++        final StringBuilder sb = new StringBuilder(2048);
++        for (final String s : this.recentStructuralOps) {
++            sb.append("    ").append(s).append('\n');
++        }
++        return sb.length() == 0 ? "    (none)\n" : sb.toString();
++    }
++
+     private void onRegionCreate(final ThreadedRegion<R, S> region) {
+         final ThreadedRegion<R, S> conflict;
+         if ((conflict = this.regionsById.putIfAbsent(region.id, region)) != null) {
+@@ -661,6 +_,7 @@
+ 
+         // only after invoking data callbacks
+ 
++        final StringBuilder newIds = new StringBuilder(); // Canvas - diagnostics
+         for (final ThreadedRegion<R, S> newRegion : newRegionsSet) {
+             newRegion.state = ThreadedRegion.STATE_READY;
+             if (!newRegion.expectingMergeFrom.isEmpty() || !newRegion.mergeIntoLater.isEmpty()) {
+@@ -668,7 +_,11 @@
+             }
+             newRegion.onCreate();
+             this.callbacks.onRegionActive(newRegion);
++            if (newIds.length() > 0) newIds.append(','); // Canvas - diagnostics
++            newIds.append('#').append(newRegion.id);     // Canvas - diagnostics
+         }
++        // Canvas - diagnostics: record recalculation/split of a released region into its successor set
++        this.recordStructuralOp("SPLIT region#" + region.id + " -> " + newRegionsSet.size() + " region(s) [" + newIds + "]");
+     }
+ 
+     // Canvas start - region threading
+@@ -917,6 +_,8 @@
+             this.tryKill();
+ 
+             this.mergeInto(mergeTarget);
++
++            this.regioniser.recordStructuralOp("MERGE region#" + this.id + " -> region#" + mergeTarget.id); // Canvas - diagnostics
+ 
+             return true;
+         }
